@@ -13,48 +13,25 @@ from .shared import shared
 
 litellm.drop_params = True
 
-def load_api_keys() -> Dict:
-    """Load API keys from files in the API_KEYS directory.
-
-    Creates API_KEYS directory if it doesn't exist.
-    Each file in API_KEYS/ should contain a single API key.
-    The filename (without extension) becomes part of the environment variable name.
-
-    Returns
-    -------
-    Dict
-        Dictionary mapping environment variable names to API key values
-    """
-    Path("API_KEYS").mkdir(exist_ok=True)
-    if not list(Path("API_KEYS").iterdir()):
-        shared.red("## No API_KEYS found in API_KEYS")
-    api_keys = {}
-    for apifile in Path("API_KEYS").iterdir():
-        keyname = f"{apifile.stem.upper()}_API_KEY"
-        key = apifile.read_text().strip()
-        os.environ[keyname] = key
-        api_keys[keyname] = key
-    return api_keys
-
 
 llm_price = {}
 for k, v in litellm.model_cost.items():
     llm_price[k] = v
 
-embedding_models = [
-        "openai/text-embedding-3-large",
-        "openai/text-embedding-3-small",
-        "mistral/mistral-embed",
-        ]
+embedding_models = ["openai/text-embedding-3-large",
+                    "openai/text-embedding-3-small",
+                    "mistral/mistral-embed"]
 
 # steps : price
-sd_price = {
-    "15": 0.001,
-    "30": 0.002,
-    "50": 0.004,
-    "100": 0.007,
-    "150": "0.01",
-}
+sd_price = {"15": 0.001,
+            "30": 0.002,
+            "50": 0.004,
+            "100": 0.007,
+            "150": 0.01}
+
+tokenizer = tiktoken.encoding_for_model("gpt-3.5-turbo")
+llm_cache = Memory(".cache", verbose=0)
+
 
 def llm_cost_compute(
         input_cost: int,
@@ -79,9 +56,6 @@ def llm_cost_compute(
     return input_cost * price["input_cost_per_token"] + output_cost * price["output_cost_per_token"]
 
 
-tokenizer = tiktoken.encoding_for_model("gpt-3.5-turbo")
-
-
 def tkn_len(message: Union[str, List[Union[str, Dict]], Dict]):
     if isinstance(message, str):
         return len(tokenizer.encode(dedent(message)))
@@ -90,7 +64,6 @@ def tkn_len(message: Union[str, List[Union[str, Dict]], Dict]):
     elif isinstance(message, list):
         return sum([tkn_len(subel) for subel in message])
 
-llm_cache = Memory(".cache", verbose=0)
 
 @llm_cache.cache
 def chat(
@@ -111,6 +84,7 @@ def chat(
     if check_reason:
         assert all(a["finish_reason"] == "stop" for a in answer["choices"]), f"Found bad finish_reason: '{answer}'"
     return answer
+
 
 def wrapped_model_name_matcher(model: str) -> str:
     "find the best match for a modelname (wrapped to make some check)"
@@ -147,9 +121,9 @@ def wrapped_model_name_matcher(model: str) -> str:
         return match[0]
     else:
         print(f"Couldn't match the modelname {model} to any known model. "
-            "Continuing but this will probably crash DocToolsLLM further "
-            "down the code.")
+              "Continuing but this will probably crash further down the code.")
         return model
+
 
 def model_name_matcher(model: str) -> str:
     """find the best match for a modelname (wrapper that checks if the matched

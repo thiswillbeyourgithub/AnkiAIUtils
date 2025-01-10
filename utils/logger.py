@@ -85,6 +85,6 @@ def create_loggers(local_file: Union[str, PosixPath], colors: List[str]):
     out = []
     for col in colors:
         log = coloured_logger(col)
-        setattr(shared, "col", log)
+        setattr(shared, col, log)
         out.append(log)
     return out

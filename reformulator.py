@@ -31,7 +31,7 @@ import pandas as pd
 import litellm
 
 from utils.misc import load_formatting_funcs, replace_media
-from utils.llm import load_api_keys, llm_price, tkn_len, chat, model_name_matcher
+from utils.llm import llm_price, tkn_len, chat, model_name_matcher
 from utils.anki import anki, sync_anki, addtags, removetags, updatenote
 from utils.logger import create_loggers
 from utils.datasets import load_dataset, semantic_prompt_filtering
@@ -50,8 +50,6 @@ whi, yel, red = create_loggers(log_file, ["white", "yellow", "red"])
 # get today's date for the logging and tags
 d = datetime.datetime.today()
 today = f"{d.day:02d}_{d.month:02d}_{d.year:04d}"
-
-load_api_keys()
 
 
 # status string
@@ -184,7 +182,7 @@ class AnkiReformulator:
                     [print(line) for line in traceback.format_tb(exc_traceback)]
                     print(str(exc_value))
                     print(str(exc_type))
-                    print("\n--verbose was used so opening debug console at the "
+                    print("\n--debug was used so opening debug console at the "
                       "appropriate frame. Press 'c' to continue to the frame "
                       "of this print.")
                     pdb.post_mortem(exc_traceback)
@@ -209,7 +207,7 @@ class AnkiReformulator:
         litellm.set_verbose = verbose
 
         # arg sanity check and storing
-        assert "note:" in query, "You have to specify a notetype in the query"
+        assert "note:" in query, f"You have to specify a notetype in the query ({query})"
         assert mode in ["reformulate", "reset"], "Invalid value for 'mode'"
         assert isinstance(exclude_done, bool), "exclude_done must be a boolean"
         assert isinstance(exclude_version, bool), "exclude_version must be a boolean"
@@ -224,8 +222,13 @@ class AnkiReformulator:
             parallel = int(parallel)
         main_field_index = int(main_field_index)
         assert main_field_index >= 0, "invalid field_index"
+        self.base_query = query
+        self.dataset_path = dataset_path
         self.mode = mode
-        if string_formatting is not None:
+        self.exclude_done = exclude_done
+        self.exclude_version = exclude_version
+
+        if string_formatting:
             red(f"Loading specific string formatting from {string_formatting}")
             cloze_input_parser, cloze_output_parser = load_formatting_funcs(
                     path=string_formatting,
@@ -256,29 +259,36 @@ class AnkiReformulator:
         else:
             raise Exception(f"{llm} not found in llm_price")
         self.verbose = verbose
-        if mode == "reformulate":
-            if exclude_done:
+
+    def reformulate(self):
+        query = self.base_query
+        if self.mode == "reformulate":
+            if self.exclude_done:
                 query += " -AnkiReformulator::Done::*"
 
-            if exclude_version:
+            if self.exclude_version:
                 query += f" -AnkiReformulator:\"*version*=*'{self.VERSION}'*\""
 
-        # load db just in case
+        # load db just in case, and create one if it doesn't already exist
         self.db_content = self.load_db()
         if not self.db_content:
-            red(
-                "Empty database. If you have already ran anki_reformulator "
-                "before then something went wrong!"
-            )
-        else:
-            self.compute_cost(self.db_content)
+            red("Empty database. If you have already ran anki_reformulator "
+                "before then something went wrong!")
+            whi("Creating a empty database")
+            self.save_to_db({})
+            self.db_content = self.load_db()
+            assert self.db_content, "Could not create database"
+
+        whi("Computing estimated costs")
+        self.compute_cost(self.db_content)
 
         # load dataset
-        dataset = load_dataset(dataset_path)
-        # check that each note is valid but exclude the system prompt
-        for id, d in enumerate(dataset):
-            if id != 0:
-                dataset[id]["content"] = self.cloze_input_parser(d["content"]) if iscloze(d["content"]) else d["content"]
+        whi("Loading dataset")
+        dataset = load_dataset(self.dataset_path)
+        # check that each note is valid but exclude the system prompt, which is
+        # the first entry
+        for id, d in enumerate(dataset[1:]):
+            dataset[id]["content"] = self.cloze_input_parser(d["content"]) if iscloze(d["content"]) else d["content"]
         assert len(dataset) % 2 == 1, "Even number of examples in dataset"
         self.dataset = dataset
 
@@ -286,26 +296,25 @@ class AnkiReformulator:
         nids = anki(action="findNotes",
                     query="tag:AnkiReformulator::RESETTING")
         if nids:
-            red(
-                f"Found {len(nids)} notes with tag AnkiReformulator::RESETTING : {nids}"
-            )
+            red(f"Found {len(nids)} notes with tag AnkiReformulator::RESETTING : {nids}")
         nids = anki(action="findNotes", query="tag:AnkiReformulator::DOING")
         if nids:
             red(f"Found {len(nids)} notes with tag AnkiReformulator::DOING : {nids}")
 
-        # find notes ids for the first time
+        # find notes ids for the specific note type
         nids = anki(action="findNotes", query=query)
         assert nids, f"No notes found for the query '{query}'"
 
-        # find the model field names
-        fields = anki(
-            action="notesInfo",
-            notes=[int(nids[0])]
-            )[0]["fields"]
-        assert (
-            "AnkiReformulator" in fields.keys()
-        ), "The notetype to edit must have a field called 'AnkiReformulator'"
-        self.field_name = list(fields.keys())[0]
+        # find the field names for this note type
+        fields = anki(action="notesInfo",
+                      notes=[int(nids[0])])[0]["fields"]
+        assert "AnkiReformulator" in fields.keys(), \
+                "The notetype to edit must have a field called 'AnkiReformulator'"
+        try:
+            self.field_name = list(fields.keys())[self.field_index]
+        except IndexError:
+            raise AssertionError(f"main_field_index {self.field_index} is invalid. "
+                                 f"Note only has {len(fields.keys())} fields!")
 
         if self.exclude_media:
             # now find notes ids after excluding the img in the important field
@@ -316,7 +325,7 @@ class AnkiReformulator:
             query += f' -{self.field_name}:"*http://*"'
             query += f' -{self.field_name}:"*https://*"'
 
-        whi(f"Query to find note: {query}")
+        whi(f"Query to find note: '{query}'")
         nids = anki(action="findNotes", query=query)
         assert nids, f"No notes found for the query '{query}'"
         whi(f"Found {len(nids)} notes")
@@ -326,14 +335,13 @@ class AnkiReformulator:
             anki(action="notesInfo", notes=nids)
         ).set_index("noteId")
         self.notes = self.notes.loc[nids]
-        assert not self.notes.empty, "Empty notes df"
+        assert not self.notes.empty, "Empty notes"
 
-        assert (
-            len(set(self.notes["modelName"].tolist())) == 1
-        ), "Contains more than 1 note type"
+        assert len(set(self.notes["modelName"].tolist())) == 1, \
+                "Contains more than 1 note type"
 
         # check absence of image and sounds in the main field
-        # as well incorrect tags
+        # as well as incorrect tags
         for nid, note in self.notes.iterrows():
             if self.exclude_media:
                 _, media = replace_media(
@@ -358,38 +366,24 @@ class AnkiReformulator:
                 else:
                     assert not tag.lower().startswith("ankireformulator")
 
+        # check if required tokens are higher than our limits
+        tkn_sum = sum(tkn_len(d["content"]) for d in self.dataset)
+        tkn_sum += sum(tkn_len(replace_media(content=note["fields"][self.field_name]["value"],
+                                             media=None,
+                                             mode="remove_media")[0])
+                       for _, note in self.notes.iterrows())
+        assert tkn_sum <= tkn_warn_limit, (f"Found {tkn_sum} tokens to process, which is "
+                                           f"higher than the limit of {tkn_warn_limit}")
 
-        # check if too many tokens
-        tkn_sum = sum([tkn_len(d["content"]) for d in self.dataset])
-        tkn_sum += sum(
-            [
-                tkn_len(
-                    replace_media(
-                        content=note["fields"][self.field_name]["value"],
-                        media=None,
-                        mode="remove_media",
-                    )[0]
-                )
-                for _, note in self.notes.iterrows()
-            ])
-        if tkn_sum > tkn_warn_limit:
-            raise Exception(
-                f"Found {tkn_sum} tokens to process, which is "
-                f"higher than the limit of {tkn_warn_limit}"
-            )
-
-        if len(self.notes) > n_note_limit:
-            raise Exception(
-                f"Found {len(self.notes)} notes to process "
-                f"which is higher than the limit of {n_note_limit}"
-            )
+        assert len(self.notes) <= n_note_limit, (f"Found {len(self.notes)} notes to process "
+                                                 f"which is higher than the limit of {n_note_limit}")
 
         if self.mode == "reformulate":
-            func = self.reformulate
+            func = self.reformulate_note
         elif self.mode == "reset":
-            func = self.reset
+            func = self.reset_note
         else:
-            raise ValueError(self.mode)
+            raise ValueError(f"Unknown mode {self.mode}")
 
         def error_wrapped_func(*args, **kwargs):
             """Wrapper that catches exceptions and marks failed notes with appropriate tags."""
@@ -397,7 +391,7 @@ class AnkiReformulator:
                 return func(*args, **kwargs)
             except Exception as err:
                 addtags(nid=note.name, tags="AnkiReformulator::FAILED")
-                red(f"Error when running self.{self.mode}: '{err}'")
+                red(f"Error when running self.{func.__name__}: '{err}'")
                 return str(err)
 
         # getting all the new values in parallel and using caching
@@ -413,11 +407,9 @@ class AnkiReformulator:
             )
         )
 
-        failed_runs = [
-            self.notes.iloc[i_nv]
-            for i_nv in range(len(new_values))
-            if isinstance(new_values[i_nv], str)
-        ]
+        failed_runs = [self.notes.iloc[i_nv]
+                       for i_nv in range(len(new_values))
+                       if isinstance(new_values[i_nv], str)]
         if failed_runs:
             red(f"Found {len(failed_runs)} failed notes")
             failed_run_index = pd.DataFrame(failed_runs).index
@@ -427,6 +419,7 @@ class AnkiReformulator:
             assert len(new_values) == len(self.notes)
 
         # applying the changes
+        whi("Applying changes")
         for values in tqdm(new_values, desc="Applying changes to anki"):
             if self.mode == "reformulate":
                 self.apply_reformulate(values)
@@ -435,8 +428,10 @@ class AnkiReformulator:
             else:
                 raise ValueError(self.mode)
 
+        whi("Clearing unused tags")
         anki(action="clearUnusedTags")
 
+        # TODO: Why add and them remove them?
         # add and remove the tag TODO to make it easier to re add by the user
         # as it was cleared by calling 'clearUnusedTags'
         nid, note = next(self.notes.iterrows())
@@ -445,7 +440,7 @@ class AnkiReformulator:
 
         sync_anki()
 
-        # display again the total cost at the end
+        # display the total cost again at the end
         db = self.load_db()
         assert db, "Empty database at the end of the run. Something went wrong?"
         self.compute_cost(db)
@@ -456,11 +451,11 @@ class AnkiReformulator:
         This is used to know if something went wrong.
         """
         n_db = len(db_content)
-        red(f"Number of entries in databases/reformulator.db: {n_db}")
+        red(f"Number of entries in databases/reformulator/reformulator.db: {n_db}")
         dol_costs = []
         dol_missing = 0
         for dic in db_content:
-            if dic["mode"] != "reformulate":
+            if self.mode != "reformulate":
                 continue
             try:
                 dol = float(dic["dollar_price"])
@@ -482,16 +477,16 @@ class AnkiReformulator:
         elif dol_costs:
             self._cost_so_far = dol_total
 
-    def reformulate(self, nid: int, note: pd.Series) -> Dict:
+    def reformulate_note(self, nid: int, note: pd.Series) -> Dict:
         """Generate a reformulated version of a note's content using an LLM.
-        
+
         Parameters
         ----------
         nid : int
             Note ID from Anki
         note : pd.Series
             Row from the notes DataFrame containing the note data
-            
+
         Returns
         -------
         Dict
@@ -512,7 +507,7 @@ class AnkiReformulator:
         # reformulate the content
         content = note["fields"][self.field_name]["value"]
         log["note_field_content"] = content
-        formattedcontent = self.cloze_input_parser(content) if iscloze(content) else content
+        formattedcontent = self.cloze_input_parser(content)
         log["note_field_formattedcontent"] = formattedcontent
 
         # if the card is in the dataset, just take the dataset value directly
@@ -535,19 +530,20 @@ class AnkiReformulator:
                 elif d["role"] == "user":
                     newcontent = self.dataset[i + 1]["content"]
                 else:
-                    raise ValueError(
-                        f"Unexpected role of message in dataset: {d}")
+                    raise ValueError(f"Unexpected role of message in dataset: {d}")
                 skip_llm = True
                 break
 
         fc, media = replace_media(
             content=formattedcontent,
             media=None,
-            mode="remove_media",
-        )
+            mode="remove_media")
         log["media"] = media
 
-        if not skip_llm:
+        if skip_llm:
+            log["llm_answer"] = {"Skipped": True}
+            log["dollar_price"] = 0
+        else:
             dataset = copy.deepcopy(self.dataset)
             curr_mess = [{"role": "user", "content": fc}]
             dataset = semantic_prompt_filtering(
@@ -559,8 +555,7 @@ class AnkiReformulator:
                 embedding_model=self.embedding_model,
                 whi=whi,
                 yel=yel,
-                red=red,
-            )
+                red=red)
             dataset += curr_mess
 
             assert dataset[0]["role"] == "system", "First message is not from system!"
@@ -603,16 +598,13 @@ class AnkiReformulator:
                 )
             else:
                 log["dollar_price"] = "?"
-        else:
-            log["llm_answer"] = {"Skipped": True}
-            log["dollar_price"] = 0
 
         log["note_field_newcontent"] = newcontent
-        formattednewcontent = self.cloze_output_parser(newcontent) if iscloze(newcontent) else newcontent
+        formattednewcontent = self.cloze_output_parser(newcontent)
         log["note_field_formattednewcontent"] = formattednewcontent
         log["status"] = STAT_OK_REFORM
 
-        if iscloze(content + newcontent + formattednewcontent):
+        if iscloze(content) and iscloze( newcontent + formattednewcontent):
             # check that no cloze were lost
             for cl in getclozes(content):
                 cl = cl.split("::")[0] + "::"
@@ -628,7 +620,7 @@ class AnkiReformulator:
 
     def apply_reformulate(self, log: Dict) -> None:
         """Apply reformulation changes to an Anki note and update its metadata.
-        
+
         Parameters
         ----------
         log : Dict
@@ -651,7 +643,7 @@ class AnkiReformulator:
 
         new_minilog = rtoml.dumps(minilog, pretty=True)
         new_minilog = new_minilog.strip().replace("\n", "<br>")
-        previous_minilog = note["fields"]["AnkiReformulator"]["value"].strip()
+        previous_minilog = note["fields"].get("AnkiReformulator", {}).get("value", "").strip()
         if previous_minilog:
             new_minilog += "<!--SEPARATOR-->"
             new_minilog += "<br><br><details><summary>Older minilog</summary>"
@@ -681,6 +673,7 @@ class AnkiReformulator:
             nid,
             fields={
                 self.field_name: log["note_field_formattednewcontent"],
+                # TODO: Might be nice to not require this
                 "AnkiReformulator": new_minilog,
             },
         )
@@ -696,16 +689,16 @@ class AnkiReformulator:
         # remove DOING tag
         removetags(nid, "AnkiReformulator::DOING")
 
-    def reset(self, nid: int, note: pd.Series) -> Dict:
+    def reset_note(self, nid: int, note: pd.Series) -> Dict:
         """Reset a note back to its state before reformulation.
-        
+
         Parameters
         ----------
         nid : int
             Note ID from Anki
         note : pd.Series
             Row from the notes DataFrame containing the note data
-            
+
         Returns
         -------
         Dict
@@ -736,18 +729,14 @@ class AnkiReformulator:
         ]
 
         if not entries:
-            red(
-                f"Entry not found for note {nid}. Looking for the content of "
-                "the field AnkiReformulator"
-            )
+            red(f"Entry not found for note {nid}. Looking for the content of "
+                "the field AnkiReformulator")
             logfield = note["fields"]["AnkiReformulator"]["value"]
             logfield = logfield.split(
                 "<!--SEPARATOR-->")[0]  # keep most recent
             if not logfield.strip():
-                raise Exception(
-                    f"Note {nid} was not found in the db and its "
-                    "AnkiReformulator field was empty."
-                )
+                raise Exception(f"Note {nid} was not found in the db and its "
+                                "AnkiReformulator field was empty.")
 
             # replace the [[c1::cloze]] by {{c1::cloze}}
             logfield = logfield.replace("]]", "}}")
@@ -757,7 +746,7 @@ class AnkiReformulator:
 
             # parse old content
             buffer = []
-            for i, line in enumerate(logfield.split("<br>")):
+            for line in logfield.split("<br>"):
                 if buffer:
                     try:
                         _ = rtoml.loads("".join(buffer + [line]))
@@ -776,10 +765,12 @@ class AnkiReformulator:
 
             # parse new content at the time
             buffer = []
-            for i, line in enumerate(logfield.split("<br>")):
+            for line in logfield.split("<br>"):
                 if buffer:
                     try:
-                        _ = rtoml.loads("".join(buffer + [line]))
+                        # TODO: What are you trying to do here? Just check that adding the line keeps valid toml?
+                        # If so, you should catch the specific exception that the load function raises on error
+                        rtoml.loads("".join(buffer + [line]))
                         buffer.append(line)
                         continue
                     except Exception:
@@ -879,7 +870,7 @@ class AnkiReformulator:
 
     def apply_reset(self, log: Dict) -> None:
         """Apply reset changes to an Anki note and update its metadata.
-        
+
         Parameters
         ----------
         log : Dict
@@ -933,10 +924,8 @@ class AnkiReformulator:
 
         # remove TO_RESET tag if present
         removetags(nid, "AnkiReformulator::TO_RESET")
-
         # remove Done tag
         removetags(nid, "AnkiReformulator::Done")
-
         # remove DOING tag
         removetags(nid, "AnkiReformulator::RESETTING")
 
@@ -946,12 +935,12 @@ class AnkiReformulator:
 
     def save_to_db(self, dictionnary: Dict) -> bool:
         """Save a log dictionary to the SQLite database.
-        
+
         Parameters
         ----------
         dictionnary : Dict
             Log dictionary to save
-            
+
         Returns
         -------
         bool
@@ -976,34 +965,35 @@ class AnkiReformulator:
 
     def load_db(self) -> Dict:
         """Load all log dictionaries from the SQLite database.
-        
+
         Returns
         -------
         Dict
             All log dictionaries from the database, or False if database not found
         """
         if not (REFORMULATOR_DIR / "reformulator.db").exists():
-            red("db not found: '$REFORMULATOR_DIR/reformulator.db'")
+            red(f"db not found: '{REFORMULATOR_DIR}/reformulator.db'")
             return False
         conn = sqlite3.connect(str((REFORMULATOR_DIR / "reformulator.db").absolute()))
         cursor = conn.cursor()
         cursor.execute("SELECT data FROM dictionaries")
         rows = cursor.fetchall()
-        dictionaries = []
-        for row in rows:
-            dictionary = json.loads(zlib.decompress(row[0]))
-            dictionaries.append(dictionary)
-        return dictionaries
+        # TODO: Why do you compress? This just makes it more difficult to debug
+        return [json.loads(zlib.decompress(row[0])) for row in rows]
 
 
 if __name__ == "__main__":
     try:
         args, kwargs = fire.Fire(lambda *args, **kwargs: [args, kwargs])
         if "help" in kwargs:
-            print(help(AnkiReformulator))
+            print(help(AnkiReformulator), file=sys.stderr)
         else:
             whi(f"Launching reformulator.py with args '{args}' and kwargs '{kwargs}'")
-            AnkiReformulator(*args, **kwargs)
-    except Exception:
-        sync_anki()
+            r = AnkiReformulator(*args, **kwargs)
+            r.reformulate()
+            sync_anki()
+    except AssertionError as e:
+        red(e)
+    except Exception as e:
+        red(e)
         raise

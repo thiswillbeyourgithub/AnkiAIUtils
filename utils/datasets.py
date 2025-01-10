@@ -1,3 +1,4 @@
+import collections
 import json
 import pandas as pd
 import litellm
@@ -51,9 +52,10 @@ def load_dataset(
 
     Returns
     -------
-    Dict
+    List
         List of message dictionaries with 'role' and 'content' keys,
-        validated according to check_dataset() rules
+        validated according to check_dataset() rules.
+        First message is the system message.
 
     Raises
     ------
@@ -366,25 +368,21 @@ def semantic_prompt_filtering(
     if len(output_pr) != len(prompt_messages):
         red(f"Tokens of the kept prompts after {cnt} iterations: {tkns} (of all prompts: {all_tkns} tokens) Number of prompts: {len(output_pr)}/{len(prompt_messages)}")
 
-    # check no duplicate prompts
+    # TODO: This complains about duplicates. It looks like for some reason the
+    # last one is added as assistant AND user, but we only compare the content.
     contents = [pm["content"] for pm in output_pr]
-    dupli = [dp for dp in contents if contents.count(dp) > 1]
+    dupli = [k for k,v in collections.Counter(contents).items() if v>1]
     if dupli:
         raise Exception(f"{len(dupli)} duplicate prompts found in memory.py: {dupli}")
 
-    # remove unwanted keys
-    for i, d in enumerate(output_pr):
-        keys = [k for k in d.keys()]
-        for k in keys:
-            if k not in ["content", "role"]:
-                del d[k]
-        output_pr[i] = d
+    # Keep only the content and the role keys for each prompt
+    new_output = [{k: v for k, v in pk.items() if k in {"content", "role"}} for pk in output_pr]
 
-    assert curr_mess not in output_pr
-    assert output_pr, "No prompt were selected!"
-    check_dataset(output_pr, **check_args)
+    assert curr_mess not in new_output
+    assert new_output, "No prompt were selected!"
+    check_dataset(new_output, **check_args)
 
-    return output_pr
+    return new_output
 
 
 def format_anchor_key(key: str) -> str:

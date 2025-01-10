@@ -39,4 +39,3 @@ class SharedModule:
             raise TypeError(f'SharedModule forbids the creation of unexpected attribute "{name}"')
 
 shared = SharedModule()
-

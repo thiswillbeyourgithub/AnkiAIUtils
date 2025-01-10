@@ -27,7 +27,7 @@ This collection of scripts is the culmination of my efforts to contributes the A
 
 ## Tools
 
-### Illustrator 
+### Illustrator
 Creates custom mnemonic images for your cards using AI image generation. It:
 - Analyzes card content to identify key concepts
 - Generates creative visual memory hooks
@@ -387,14 +387,21 @@ Dataset files (like `explainer_dataset.txt`, `reformulator_dataset.txt`, etc.) a
 Click to read more
 </summary>
 
+First, ensure that you API keys are set in you env variables.
+
+Next, install the [AnkiConnect](https://ankiweb.net/shared/info/2055492159) Anki addon if you don't already have it.
+
+
 #### Reformulator
+
+The reformulator expects the notes you modify to have a specific field present so that it can save the old versions and add logging. Modify the note type you want to reformulate by adding a `AnkiReformulator` field to it. 
 The Reformulator can be run from the command line:
 
 ```bash
 python reformulator.py \
-    --query "(rated:2:1 OR rated:2:2) -is:suspended" \
-    --dataset_path "data/reformulator_dataset.txt" \
-    --string_formatting "data/string_formatting.py" \
+    --query "note:Cloze (rated:2:1 OR rated:2:2) -is:suspended" \
+    --dataset_path "examples/reformulator_dataset.txt" \
+    --string_formatting "examples/string_formatting.py" \
     --ntfy_url "ntfy.sh/YOUR_TOPIC" \
     --main_field_index 0 \
     --llm "openai/gpt-4" \
